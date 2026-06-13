@@ -1,0 +1,366 @@
+"""
+Telegram bot for India Genius Challenge – Answer Collector Edition.
+Only inline buttons, no typing commands. Collects answers via probes and
+provides today's answer key as JSON.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+from io import BytesIO
+
+import aiohttp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters
+)
+from telegram.error import Conflict
+
+try:
+    from telegram.constants import ParseMode
+except ImportError:
+    from telegram import ParseMode
+
+# Add current directory to path
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Configure logging
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
+logger = logging.getLogger("bot")
+logger.info("━" * 60)
+logger.info("Answer Collector Bot starting")
+logger.info("━" * 60)
+
+# Import backend functions
+from genius_1780164377809 import (
+    load_cache, save_cache, merged_quiz_cache,
+    run_probe_attempt, is_cache_saturated,
+    QUIZ_KEY, load_probe_stats, save_probe_stats
+)
+from ai_solver import AIConfig, test_ai_connection
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable not set")
+
+# Conversation states for AI setup
+WAITING_FOR_AI_PROVIDER = 1
+WAITING_FOR_AI_KEY = 2
+
+# ----------------------------------------------------------------------
+# Helper: get today's answer key as JSON bytes
+# ----------------------------------------------------------------------
+def get_answer_key_json() -> tuple[bytes, str] | tuple[None, None]:
+    """Return (json_bytes, filename) or (None, None) if no answers."""
+    cache = load_cache()
+    today_cache = cache.get(QUIZ_KEY, {})
+    if not today_cache:
+        return None, None
+
+    answer_list = [
+        {"question_id": qid, "correct_answer": answer}
+        for qid, answer in today_cache.items()
+    ]
+    json_str = json.dumps(answer_list, indent=2, ensure_ascii=False)
+    filename = f"answers_{datetime.now().strftime('%Y-%m-%d')}.json"
+    return json_str.encode("utf-8"), filename
+
+# ----------------------------------------------------------------------
+# Inline keyboard builders
+# ----------------------------------------------------------------------
+def main_menu() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("📅 Get Today's Answer Key", callback_data="get_answers")],
+        [InlineKeyboardButton("🔍 Collect New Answers (Probe)", callback_data="collect")],
+        [InlineKeyboardButton("📊 Cache Statistics", callback_data="stats")],
+        [InlineKeyboardButton("⚙️ Configure AI Provider", callback_data="config_ai")],
+        [InlineKeyboardButton("🧪 Test AI Connection", callback_data="test_ai")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ----------------------------------------------------------------------
+# Handlers
+# ----------------------------------------------------------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show main menu with buttons."""
+    await update.message.reply_text(
+        "🤖 *India Genius Challenge – Answer Collector*\n\n"
+        "I collect answers for the daily quiz using anonymous probes.\n"
+        "Use the buttons below to get the answer key or refresh the cache.\n\n"
+        "🔐 *No cookies, no profiles, no linking.*\n"
+        "Just answers.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu()
+    )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data == "get_answers":
+        await send_answer_key(query)
+    elif data == "collect":
+        await run_collection(query, context)
+    elif data == "stats":
+        await show_stats(query)
+    elif data == "config_ai":
+        await start_ai_config(query, context)
+    elif data == "test_ai":
+        await test_ai(query)
+    else:
+        await query.edit_message_text("❓ Unknown option.", reply_markup=main_menu())
+
+async def send_answer_key(query):
+    """Send today's answer key as a JSON file."""
+    json_bytes, filename = get_answer_key_json()
+    if json_bytes is None:
+        await query.edit_message_text(
+            "❌ No answers collected yet for today.\n"
+            "Use *Collect New Answers* first.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu()
+        )
+        return
+
+    await query.edit_message_text(
+        "📤 *Sending answer key...*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await query.message.reply_document(
+        document=BytesIO(json_bytes),
+        filename=filename,
+        caption=f"✅ Answer key for {datetime.now().strftime('%Y-%m-%d')}\n{len(json.loads(json_bytes))} answers."
+    )
+    await query.message.reply_text("📋 Back to main menu:", reply_markup=main_menu())
+
+async def run_collection(query, context: ContextTypes.DEFAULT_TYPE):
+    """Run probe collection with progress updates."""
+    msg = await query.edit_message_text(
+        "🔍 *Starting answer collection...*\n"
+        "This may take several minutes. I'll notify you when done.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # Load current state
+    cache = load_cache()
+    quiz_cache = merged_quiz_cache(cache)
+    question_meta = dict(cache.get("question_meta", {}))
+    tried_options = cache.get("tried_options", {})
+    probe_stats = load_probe_stats()
+    num_runs = 50
+    total_learned = 0
+
+    connector = aiohttp.TCPConnector(limit=100)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for i in range(1, num_runs + 1):
+            learned = await run_probe_attempt(
+                session, quiz_cache, question_meta, tried_options, i, probe_stats
+            )
+            total_learned += learned
+
+            # Save cache periodically
+            if i % 10 == 0:
+                cache[QUIZ_KEY] = quiz_cache
+                cache["question_meta"] = question_meta
+                cache["tried_options"] = tried_options
+                save_cache(cache)
+                save_probe_stats(probe_stats)
+
+            # Update progress message every 5 probes
+            if i % 5 == 0:
+                await msg.edit_text(
+                    f"🔍 *Collecting answers...* ({i}/{num_runs})\n"
+                    f"📚 Learned {total_learned} new answers so far.\n"
+                    f"🗂️ Total cached: {len(quiz_cache)}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            await asyncio.sleep(3)  # polite delay between probes
+
+        # Final save
+        cache[QUIZ_KEY] = quiz_cache
+        cache["question_meta"] = question_meta
+        cache["tried_options"] = tried_options
+        save_cache(cache)
+        save_probe_stats(probe_stats)
+
+    await msg.edit_text(
+        f"✅ *Collection finished!*\n"
+        f"📚 Learned {total_learned} new answers.\n"
+        f"🗂️ Total cached answers: {len(quiz_cache)}\n\n"
+        f"Use the menu to get the answer key.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu()
+    )
+
+async def show_stats(query):
+    """Show cache statistics."""
+    cache = load_cache()
+    quiz_cache = merged_quiz_cache(cache)
+    stats = load_probe_stats()
+    questions_seen = len(stats.get("questions", {}))
+    cached = len(quiz_cache)
+    coverage = (cached / questions_seen * 100) if questions_seen > 0 else 0
+    await query.edit_message_text(
+        f"📊 *Cache Statistics*\n\n"
+        f"🗂️ *Answers cached:* `{cached}`\n"
+        f"🔍 *Questions seen in probes:* `{questions_seen}`\n"
+        f"📈 *Coverage:* `{coverage:.1f}%`\n\n"
+        f"💡 Run *Collect New Answers* to improve coverage.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu()
+    )
+
+# ----------------------------------------------------------------------
+# AI Configuration Conversation
+# ----------------------------------------------------------------------
+async def start_ai_config(query, context: ContextTypes.DEFAULT_TYPE):
+    """Start conversation to set AI provider."""
+    keyboard = [
+        [InlineKeyboardButton("Groq", callback_data="ai_provider_groq")],
+        [InlineKeyboardButton("Gemini", callback_data="ai_provider_gemini")],
+        [InlineKeyboardButton("OpenRouter", callback_data="ai_provider_openrouter")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_ai_config")],
+    ]
+    await query.edit_message_text(
+        "🤖 *Configure AI Provider*\n\n"
+        "Select a provider (all have free tiers):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_FOR_AI_PROVIDER
+
+async def ai_provider_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    provider = query.data.replace("ai_provider_", "")
+    context.user_data["ai_provider"] = provider
+    await query.edit_message_text(
+        f"✅ Selected provider: *{provider}*\n\n"
+        "Now send me your API key.\n"
+        "You can cancel with /cancel.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return WAITING_FOR_AI_KEY
+
+async def receive_ai_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    api_key = update.message.text.strip()
+    provider = context.user_data.get("ai_provider")
+    if not provider:
+        await update.message.reply_text("❌ Provider missing. Please start over with /start.")
+        return ConversationHandler.END
+
+    cfg = AIConfig(provider=provider, api_key=api_key)
+    cfg.save()
+    await update.message.reply_text(
+        f"✅ AI configured: *{provider}*\n"
+        f"Use *Test AI Connection* from the menu to verify.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu()
+    )
+    return ConversationHandler.END
+
+async def cancel_ai_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await query.edit_message_text(
+            "AI configuration cancelled.",
+            reply_markup=main_menu()
+        )
+    else:
+        await update.message.reply_text("Cancelled.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+async def test_ai(query):
+    """Test currently configured AI."""
+    cfg = AIConfig.load()
+    if not cfg.is_configured:
+        await query.edit_message_text(
+            "❌ No AI configured. Use *Configure AI Provider* first.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu()
+        )
+        return
+
+    await query.edit_message_text(
+        "🧪 *Testing AI connection...*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    connector = aiohttp.TCPConnector(limit=10)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        result = await test_ai_connection(cfg, session=session)
+    status = "✅" if result["ok"] else "❌"
+    text = (
+        f"{status} *AI Test Result*\n"
+        f"Provider: {result['provider']}\n"
+        f"Answer: {result['answer']}\n"
+        f"Correct: {result['correct']}\n"
+        f"Latency: {result['latency']}s"
+    )
+    await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+
+# ----------------------------------------------------------------------
+# Error handler
+# ----------------------------------------------------------------------
+async def error_handler(update, context):
+    if isinstance(context.error, Conflict):
+        logger.critical("Another bot instance running. Exiting.")
+        sys.exit(1)
+    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_error_handler(error_handler)
+
+    # Start command
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+
+    # Callback handler for main menu buttons
+    app.add_handler(CallbackQueryHandler(button_callback, pattern="^(get_answers|collect|stats|config_ai|test_ai)$"))
+    app.add_handler(CallbackQueryHandler(ai_provider_callback, pattern="^ai_provider_"))
+    app.add_handler(CallbackQueryHandler(cancel_ai_config, pattern="^cancel_ai_config$"))
+
+    # AI config conversation
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_ai_config, pattern="^config_ai$")],
+        states={
+            WAITING_FOR_AI_PROVIDER: [
+                CallbackQueryHandler(ai_provider_callback, pattern="^ai_provider_"),
+                CallbackQueryHandler(cancel_ai_config, pattern="^cancel_ai_config$"),
+            ],
+            WAITING_FOR_AI_KEY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ai_key),
+                CommandHandler("cancel", cancel_ai_config),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_ai_config)],
+    )
+    app.add_handler(conv_handler)
+
+    logger.info("Bot started – answer collector mode (inline buttons only).")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
