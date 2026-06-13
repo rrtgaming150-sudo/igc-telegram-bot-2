@@ -1,7 +1,7 @@
 """
 Telegram bot for India Genius Challenge – Answer Collector Edition.
-Only inline buttons, no typing commands. Collects answers via probes and
-provides today's answer key as JSON.
+Runs on Render's free web service: starts an HTTP health server on port 8080
+and runs the bot in polling mode.
 """
 
 import asyncio
@@ -11,6 +11,7 @@ import os
 import sys
 from datetime import datetime
 from io import BytesIO
+from threading import Thread
 
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -51,7 +52,7 @@ logger.info("━" * 60)
 # Import backend functions
 from genius_1780164377809 import (
     load_cache, save_cache, merged_quiz_cache,
-    run_probe_attempt, is_cache_saturated,
+    run_probe_attempt,
     QUIZ_KEY, load_probe_stats, save_probe_stats
 )
 from ai_solver import AIConfig, test_ai_connection
@@ -318,6 +319,31 @@ async def test_ai(query):
     await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
 
 # ----------------------------------------------------------------------
+# HTTP health server (to keep Render happy)
+# ----------------------------------------------------------------------
+def run_health_server():
+    """Start a minimal HTTP server on port 8080 for Render health checks."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            # Suppress logs to avoid clutter
+            pass
+
+    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+    server.serve_forever()
+
+# ----------------------------------------------------------------------
 # Error handler
 # ----------------------------------------------------------------------
 async def error_handler(update, context):
@@ -329,20 +355,23 @@ async def error_handler(update, context):
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
-def main():
+async def main():
+    # Start the health server in a separate thread
+    thread = Thread(target=run_health_server, daemon=True)
+    thread.start()
+    logger.info("Health server started on port 8080")
+
+    # Build the bot application
     app = Application.builder().token(TOKEN).build()
     app.add_error_handler(error_handler)
 
-    # Start command
+    # Add handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
-
-    # Callback handler for main menu buttons
     app.add_handler(CallbackQueryHandler(button_callback, pattern="^(get_answers|collect|stats|config_ai|test_ai)$"))
     app.add_handler(CallbackQueryHandler(ai_provider_callback, pattern="^ai_provider_"))
     app.add_handler(CallbackQueryHandler(cancel_ai_config, pattern="^cancel_ai_config$"))
 
-    # AI config conversation
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_ai_config, pattern="^config_ai$")],
         states={
@@ -359,8 +388,13 @@ def main():
     )
     app.add_handler(conv_handler)
 
-    logger.info("Bot started – answer collector mode (inline buttons only).")
-    app.run_polling(drop_pending_updates=True)
+    # Start polling (this runs forever)
+    logger.info("Bot polling started")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    # Keep running
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
