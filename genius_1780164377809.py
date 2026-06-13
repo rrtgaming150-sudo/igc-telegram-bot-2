@@ -109,11 +109,18 @@ def save_cookies(file_path, raw_text):
 
 def load_cache():
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, 'r') as f:
-            cache = json.load(f)
-            return cache
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                data = f.read().strip()
+                if not data:
+                    return {}
+                return json.loads(data)
+        except (json.JSONDecodeError, IOError):
+            # If file is corrupted or empty, start fresh
+            print(f"  [WARN] Cache file {CACHE_FILE} is invalid. Creating new cache.")
+            return {}
     return {}
-
+    
 def save_cache(cache):
     with open(CACHE_FILE, 'w') as f:
         json.dump(cache, f, indent=2)
